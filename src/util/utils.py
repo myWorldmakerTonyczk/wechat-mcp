@@ -1,4 +1,26 @@
+import time
+
 import uiautomation as auto
+from dotenv import set_key
+
+
+def retry(retry_num=2,recover=None):
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            for i in range(retry_num):
+                try:
+                    value = fn(*args, **kwargs)
+                    return value
+                except Exception as e:
+                    if i == retry_num - 1:
+                        raise
+                    if recover:
+                        recover()
+                    else:
+                        time.sleep(0.5)
+        return wrapper
+    return deco
+
 def dump_tree(win, max_depth=30, include_top=True, show_rect=False, show_id=True):
     """格式化输出控件树，返回字符串（agent tool 直接返回这个）。
 
@@ -29,3 +51,6 @@ def clean_conv_name(name: str) -> str:
     return (name.replace('已置顶', '')
             .replace('免打扰', '')
             .strip())
+
+def setDenv(envName:str, value:str):
+    set_key(".env",envName,value)

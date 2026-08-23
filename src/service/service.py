@@ -3,6 +3,12 @@ import winreg
 from pathlib import Path
 
 
+def _program_data_dir() -> Path:
+    """取 ProgramData 目录。env 缺失时（MCP 子进程环境常被清掉）用 SystemDrive 兜底。"""
+    d = os.environ.get('ProgramData') or os.environ.get('SystemDrive', 'C:') + '\\ProgramData'
+    return Path(d)
+
+
 def get_app_path(app_name):
     """按软件名找 exe 全路径。app_name: 如 'WeChat.exe'（不区分大小写）"""
     app_name_l = app_name.lower()
@@ -53,8 +59,10 @@ def get_app_path(app_name):
                 pass
 
     # ③ 开始菜单快捷方式（兜底，覆盖绿色软件）
-    for base in (Path(os.environ['ProgramData']) / 'Microsoft/Windows/Start Menu/Programs',
-                 Path(os.environ['APPDATA']) / 'Microsoft/Windows/Start Menu/Programs'):
+    appdata = os.environ.get('APPDATA') or (os.environ.get('USERPROFILE')
+                                            or os.environ.get('SystemDrive', 'C:') + '\\Users') + '\\AppData\\Roaming'
+    for base in (_program_data_dir() / 'Microsoft/Windows/Start Menu/Programs',
+                 Path(appdata) / 'Microsoft/Windows/Start Menu/Programs'):
         for lnk in base.rglob('*.lnk'):
             if app_name_l in lnk.stem.lower():
                 return str(lnk)
@@ -71,11 +79,15 @@ def list_desktop_apps():
     wsh = CreateObject('WScript.Shell', dynamic=True)   # 解析 .lnk 需要
     by_path = {}                                        # path -> name（去重）
 
+    system_drive = os.environ.get('SystemDrive', 'C:')
+    userprofile = os.environ.get('USERPROFILE') or system_drive + '\\Users'
+    appdata = os.environ.get('APPDATA') or userprofile + '\\AppData\\Roaming'
+    public = os.environ.get('PUBLIC') or system_drive + '\\Users\\Public'
     dirs = [
-        Path(os.environ['APPDATA']) / 'Microsoft/Windows/Start Menu/Programs',
-        Path(os.environ['ProgramData']) / 'Microsoft/Windows/Start Menu/Programs',
-        Path(os.environ['USERPROFILE']) / 'Desktop',                 # 我的桌面
-        Path(os.environ['PUBLIC']) / 'Desktop',                      # 公共桌面
+        Path(appdata) / 'Microsoft/Windows/Start Menu/Programs',
+        _program_data_dir() / 'Microsoft/Windows/Start Menu/Programs',
+        Path(userprofile) / 'Desktop',                 # 我的桌面
+        Path(public) / 'Desktop',                      # 公共桌面
     ]
     for d in dirs:
         if not d.exists():
