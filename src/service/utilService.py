@@ -1,11 +1,17 @@
+import json
+import os
+
+from dotenv import load_dotenv
+from fastmcp.exceptions import ToolError
+
 from util.we_chat_utils import send_msg, _get_partner_control, get_msg_list
 
 
-def sendPartnerMsg(msg:str,user_name:str):
-    return send_msg(msg,_get_partner_control(user_name))
+def sendPartnerMsg(user_name:str, msg:str="", call:str|None=None):
+    return send_msg(_get_partner_control(user_name), msg, call)
 
-def getPartnerMsgList(user_name:str):
-    return get_msg_list(_get_partner_control(user_name) )
+def getPartnerMsgList(user_name:str, load_more:bool=False):
+    return get_msg_list(_get_partner_control(user_name), load_more)
 
 
 def get_recent_messages(user_name: str, n: int = 10) -> list[str]:
@@ -21,6 +27,34 @@ def get_recent_messages(user_name: str, n: int = 10) -> list[str]:
     msgs = get_msg_list(_get_partner_control(user_name))
     texts = [m for m in msgs if not m.startswith("[时间]：")]
     return texts[-n:]
+
+
+_CACHE_KEYS = {
+    "partners": ("WE_CHAT_PARTNERS_LIST", "listWeChatPartners"),
+    "contacts": ("WE_CHAT_CONTACTS_LIST", "listWeChatContacts"),
+}
+
+
+def get_cached_list(kind: str) -> list[str]:
+    """读取上次全量扫描缓存在 .env 的列表（JSON 数组）。
+
+    Args:
+        kind: "partners" 读会话列表缓存；"contacts" 读联系人列表缓存。
+
+    Returns:
+        上次扫描到的名称列表（已排序）
+    """
+    key, scan_tool = _CACHE_KEYS.get(kind, (None, None))
+    if key is None:
+        raise ToolError("kind 只能是 'partners' 或 'contacts'")
+    load_dotenv(override=True)  # 重新加载 .env，读到运行时写入的最新值
+    raw = os.getenv(key)
+    if not raw:
+        raise ToolError(f"env 里还没有 {key}，请先调用 {scan_tool} 全量扫描一次")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ToolError(f"{key} 不是合法 JSON: {e}") from e
 
 
 
