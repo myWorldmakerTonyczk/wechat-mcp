@@ -8,8 +8,9 @@ from fastmcp.tools import tool
 from service.service import get_app_path as get_app_path_l
 from service.service import list_desktop_apps as list_desktop_apps_l
 from service.utilService import (sendPartnerMsg, getPartnerMsgList,
-                                 get_recent_messages as get_recent_messages_l,
-                                 get_cached_list)
+                                 get_cached_list,
+                                 monitor_start as monitor_start_l,
+                                 monitor_poll as monitor_poll_l)
 from util.utils import setDenv
 from util.we_chat_utils import (open_wechat, list_user, list_home_chats,
                                 list_contacts, find_user, search_wechat, send_msg)
@@ -42,8 +43,15 @@ mcp = FastMCP("use_weChat",instructions=
                                         sendMsg：call=None 发文本 msg；call="voice"/"video" 发起语音/视频通话；call="hangup" 挂断当前通话
 
                                         【读消息】：
-                                          get_msg_list        → 全量消息（含"[时间]："标签）；load_more=True 会先点"查看更多消息"把历史拉满
-                                          get_recent_messages → 最近 n 条纯文本（适合监控，n 默认 10）
+                                          get_msg_list(userName, load_more, recent) → 消息列表（带发送者前缀+时间标签）；
+                                            load_more=True 点一次"查看更多消息"加载更多；recent=N 只要最近 N 条纯文本（去掉时间标签）
+
+                                        【监听主页消息】：
+                                          monitorStart(duration, interval, after) → 启动后台监听（秒回，不阻塞），
+                                            后台线程轮询主页会话，最新消息变化（预览变/未读增/新会话出现）累计记录。
+                                          monitorPoll(stop=False) → 查询状态 + 累计变化（秒回）；
+                                            有变化时自动停止监听并清空；stop=True 强制立刻停。
+                                          注意：MCP 单次调用有 60s 超时，别用长阻塞调用，用 start+poll 组合。
 
                                         【找其他软件】list_desktop_apps 列出全部；get_app_path 按名字查。
                                         """
@@ -63,14 +71,17 @@ def openWeChat(path:str|None=None):
         return open_wechat(path)
 
 @mcp.tool(run_in_thread=False)
-def listHomeChats() ->list[str]:
+def listHomeChats(full_scan:bool=False) ->list[dict]:
     """
-    列出微信主页当前可见的会话名称（轻量，快）。只包含当前屏幕上渲染的会话，不滚动。
+    列出微信主页的会话（每个会话含 名称/新消息/最后一条消息）。
+
+    Args:
+        full_scan: False=只要当前可见的（快，不滚动）；True=全量滚动扫描全部会话（慢，和 listWeChatPartners 一样）
 
     Returns:
-        当前可见会话名称列表
+        每个会话一条：{"名称":会话名, "新消息":未读数(0=无), "最后一条消息":消息预览}
     """
-    return list_home_chats()
+    return list_home_chats(full_scan)
 
 @mcp.tool(run_in_thread=False)
 def listWeChatPartners() ->list[str]:
@@ -123,35 +134,24 @@ def sendMsg(userName:str, msg:str="", call:Literal["voice","video","hangup"]|Non
     """
     return sendPartnerMsg(userName, msg, call)
 @mcp.tool(run_in_thread=False)
-def get_msg_list(userName:str, load_more:bool=False)->list[str]|dict:
+def get_msg_list(userName:str, load_more:bool=False, recent:int=10)->list[str]|dict:
     """
     获取已经打开窗口的用户会话的消息列表(若窗口未打开使用openPartnerWindow)
 
     Args:
-        userName:会话名称，有的会话名称如“祥发-已置顶”请填入全名，不要填“祥发”，（通过方法listWeChatPartners获取）
-        load_more:为True时先尝试把“查看更多消息”按钮点到底、加载全部历史。
+        userName:会话名称，有的会话名称如”祥发-已置顶”请填入全名，不要填”祥发”，（通过方法listWeChatPartners获取）
+        load_more:为True时先点一次”查看更多消息”加载更多（每次调用加载一批）。
+        recent:最近 N 条纯文本消息（时间标签不计入条数）；0=返回全部消息（含时间标签）(目前已经加载的全部消息，load_more可加载更多)。
 
     Returns:
-        消息列表，每条带发送者前缀，如“[我]：你好”/“[祥发-]：视频通话 未应答”，
-        穿插时间标签如：“[时间]：5分钟前”。
-        load_more=True 且无更多历史时返回字典 {"提示":"没有更多消息了","全部消息":[...]}，
-        其中“全部消息”就是全部消息列表
+        recent=0：消息列表，每条带发送者前缀，如”[我]：你好”/”[祥发-]：视频通话 未应答”，
+          穿插时间标签如：”[时间]：5分钟前”。
+          load_more=True 且无更多历史时返回字典 {“提示”:”没有更多消息了”,”全部消息”:[...]}，
+          其中”全部消息”就是全部消息列表
+        recent>0：最近 N 条纯文本消息（去掉时间标签，语义连续）
     """
-    return getPartnerMsgList(userName, load_more)
+    return getPartnerMsgList(userName, load_more, recent)
 
-@mcp.tool(run_in_thread=False)
-def get_recent_messages(userName:str, n:int=10)->list[str]:
-    """
-    获取指定会话最近 n 条文本消息（时间标签不计入条数）。适合监控/查看最新对话。
-
-    Args:
-        userName:会话名称，有的会话名称如“祥发-已置顶”请填入全名，不要填“祥发”，（通过方法listWeChatPartners获取）
-        n:返回的纯文本消息条数，默认 10
-
-    Returns:
-        最近 n 条消息列表（不含"[时间]："时间项），时间升序，末尾是最新的
-    """
-    return get_recent_messages_l(userName, n)
 
 @mcp.tool(run_in_thread=False)
 def list_desktop_apps()->dict[Any,Any]:
@@ -173,12 +173,12 @@ def get_app_path(app_name:str):
     return get_app_path_l(app_name)
 
 @mcp.tool(run_in_thread=False)
-def changeEnv(env_name:str, value:str)->None:
+def changeEnv(env_name: Literal["WE_CHAT_PATH"], value:str)->None:
     """
     更换或设置env配置文件中的值(重要！！！！，非必要时不要自己操作,让用户操作)
 
     Args:
-        env_name:配置项的名称（目前有“WE_CHAT_PATH”）
+        env_name:配置项的名称（目前只有“WE_CHAT_PATH”）
         value:填入的值
     """
     setDenv(env_name, value)
@@ -209,6 +209,57 @@ def getCachedList(kind: Literal["partners", "contacts"]) ->list[str]:
         上次扫描到的名称列表（已排序）
     """
     return get_cached_list(kind)
+
+@mcp.tool(run_in_thread=False)
+def monitorStart(duration: float = 120, interval: float = 5,
+                 after: Literal["keep", "minimize", "hide"] = "keep") -> dict:
+    """
+    启动后台监听微信主页会话的最新消息变化（秒回，不阻塞）。
+
+    Args:
+        duration: 监听总时长（秒），默认 120。到点自动结束。
+        interval: 刷新间隔（秒），默认 5。每次扫描约需 1~2 秒，太短没意义，建议 ≥3。
+        after: 每次扫描后窗口怎么处置 —— "keep"保持不动(推荐) / "minimize"最小化 / "hide"托盘隐藏(有风险)。
+
+    Returns:
+        立即返回 {"状态": "监听已启动", "初始未读": 首轮就带未读标签的会话列表, ...}。
+        之后用 monitorPoll 查累计变化，monitorStop 中途停止。
+    """
+    return monitor_start_l(duration, interval, after)
+
+
+@mcp.tool(run_in_thread=False)
+def monitorHomeChats(duration: float = 1200, interval: float = 10,
+                     after: Literal["keep", "minimize", "hide"] = "keep") -> dict:
+    """
+    【兼容旧名】等价于 monitorStart：启动后台监听微信主页会话的最新消息变化（秒回，不阻塞）。
+
+    Args:
+        duration: 监听总时长（秒），默认 1200。到点自动结束。
+        interval: 刷新间隔（秒），默认 10。每次扫描约需 1~2 秒，太短没意义，建议 ≥3。
+        after: 每次扫描后窗口怎么处置 —— "keep"保持不动(推荐) / "minimize"最小化 / "hide"托盘隐藏(有风险)。
+
+    Returns:
+        立即返回 {"状态": "监听已启动", "初始未读": 首轮就带未读标签的会话列表, ...}。
+        之后用 monitorPoll 查累计变化，monitorStop 中途停止。
+    """
+    return monitor_start_l(duration, interval, after)
+
+
+@mcp.tool(run_in_thread=False)
+def monitorPoll(stop: bool = False) -> dict:
+    """
+    查询后台监听状态 + 累计变化（秒回）。
+
+    stop=False（默认）：只查询；若有变化且监听仍在跑，会自动停止监听并清空本次已返回的变化，
+    避免 agent 操作窗口时与监听线程打架、也避免已处理消息残留。
+    stop=True：立刻强制停止监听（即使还没有变化）。
+
+    Returns:
+        {"状态": "监听中"/"已结束"/"已自动停止"/"已停止", "剩余秒数": N, "累计变化": [...], "监控会话数": N, "错误": None/str}
+    """
+    return monitor_poll_l(stop)
+
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

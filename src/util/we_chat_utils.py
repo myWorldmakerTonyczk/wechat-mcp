@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import time
 from typing import Literal
@@ -80,18 +81,33 @@ def open_wechat(path:str|None = WE_CHAT_PATH):
         raise ToolError(f"窗口可能未正确打开，可能未正确匹配窗口控件: {e}") from e
     return True
 
-#列出首页当前可见的会话名称（轻量，快，不滚动）
-@retry(retry_num=2)
-def list_home_chats():
-    activate_window(win_weChat, CLASS_NAME)
-    win1 = win_weChat.ListControl(Name="会话")
-    children = win1.GetChildren()
-    restore_small_window(CLASS_NAME)
-    return [i.Name for i in children if i.Name]
+#列出首页当前可见的会话（轻量，快，不滚动）。每个会话返回 名称/新消息数/最后一条消息
+def _chat_item_info(item) -> dict:
+    """从会话项提取 名称/新消息/最后一条消息。
+    未读数直接取自名字后缀"NN条新消息"（最可靠）；最后一条消息取底部非徽标文本。"""
+    nm = item.Name or ""
+    m = re.search(r"(\d+)条新消息$", nm)
+    unread = int(m.group(1)) if m else 0
+    texts = []
+    item_r = item.BoundingRectangle
+    top_limit = item_r.top + item_r.height() * 0.6  # 徽标在项的上半部
+    for c, depth in auto.WalkControl(item, maxDepth=4):
+        if c.ControlTypeName == 'TextControl' and c.Name:
+            r = c.BoundingRectangle
+            if c.Name.isdigit() and r.top < top_limit:
+                continue  # 未读数徽标（顶部小数字），不当作消息预览
+            texts.append(c.Name)
+    return {
+        "名称": re.sub(r"\s*\d+条新消息$", "", nm),
+        "新消息": unread,
+        "最后一条消息": texts[-1] if texts else "",
+    }
 
-#回滚到顶 + 自适应滚动收集列表项名字（会话/联系人列表通用）。返回排序后的名字列表。
-def _scroll_collect(lst):
-    # ① 回滚到顶部：连续 2 轮第一个项名字不变 = 到顶，停止
+
+#列出首页会话（轻量，快，不滚动）；full_scan=True 时全量滚动扫描（慢，和 list_user 一样）
+@retry(retry_num=2)
+def _scroll_to_top(lst):
+    """把列表滚到最顶。连续 2 轮第一个项名字不变 = 到顶，停止。"""
     prev_first = None
     stable = 0
     for _ in range(50):  # 最多 50 次防死循环
@@ -99,15 +115,37 @@ def _scroll_collect(lst):
         first = items[0].Name if items else None
         if first == prev_first:  # 第一项没变，可能到顶了
             stable += 1
-            if stable >= 2:
+            if stable >= 1:
                 break
         else:
             stable = 0
         prev_first = first
-        lst.WheelUp(wheelTimes=50, interval=0.01)
+        lst.WheelUp(wheelTimes=20, interval=0.01)
         time.sleep(0.2)
+
+
+def list_home_chats(full_scan:bool=False):
+    activate_window(win_weChat, CLASS_NAME)
+    lst = win_weChat.ListControl(Name="会话")
+    if full_scan:
+        result = _scroll_collect(lst, with_info=True)
+        restore_small_window(CLASS_NAME)
+        return result
+    # 非全量：先滚到最顶，再取当前可见的（保证每次看到的是顶部开始的会话）
+    _scroll_to_top(lst)
+    children = lst.GetChildren()
+    restore_small_window(CLASS_NAME)
+    return [_chat_item_info(i) for i in children if i.Name]
+
+#回滚到顶 + 自适应滚动收集（会话/联系人列表通用）。返回按真实扫描顺序（界面从上到下）的列表；
+#with_info=True 时返回 dict 列表（{"名称","新消息","最后一条消息"}）。
+def _scroll_collect(lst, with_info:bool=False):
+    # ① 回滚到顶部
+    _scroll_to_top(lst)
     # ② 从顶部向下滚动收集（自适应调速：小步起步 → 慢慢加快 → 够快后锁速划到底）
-    seen = set()
+    seen_set = set()
+    seen_order = []  # 首次扫描顺序 = 微信界面从上到下的真实顺序
+    seen_info = {} if with_info else None
     empty_rounds = 0
     initial_clicks = 8  # 初始 8 格
     clicks = initial_clicks
@@ -124,10 +162,13 @@ def _scroll_collect(lst):
             if not name:
                 continue
             visible += 1
-            if name in seen:
+            if name in seen_set:
                 dups += 1
             else:
-                seen.add(name)
+                seen_set.add(name)
+                seen_order.append(name)
+                if with_info:
+                    seen_info[name] = _chat_item_info(item)
                 new_found += 1
         # 自适应调速：
         #   重复占比高（滚太慢，每轮都在原地打转）→ 逐步加快（每次 +1 格，慢慢加）；
@@ -150,7 +191,9 @@ def _scroll_collect(lst):
                 break
         else:
             empty_rounds = 0
-    return sorted(seen)
+    if with_info:
+        return [seen_info[name] for name in seen_order]
+    return seen_order
 
 #列出全部会话名称（回滚到顶 + 滚动收集，慢但全）
 @retry(retry_num=2)
@@ -210,18 +253,56 @@ def find_user(user_name:str)->WindowControl:
         # win_search.SendKeys('{Enter}')
     except (LookupError,COMError) as e:
         raise ToolError(f"微信窗口/搜索框操作失败，请确认微信已登录且在聊天界面: {e}") from e
+    # 在搜索结果列表里定位目标会话并双击
+    # （新版微信用"搜索结果浮层" @str:IDS_FAV_SEARCH_RESULT，目标不在"会话"列表里）
+    target = None
     try:
-        win_user = win_weChat.ListControl(Name="会话").ListItemControl(Name=user_name)
-        win_user.DoubleClick(simulateMove=False)
+        result_list = win_weChat.ListControl(SubName='@str:IDS_FAV_SEARCH_RESULT')
+        for item in result_list.GetChildren():  # 优先精确全名（如"祥发-已置顶"）
+            if item.ControlType == 50007 and item.Name == user_name:
+                target = item
+                break
+        if target is None:  # 没精确匹配（传了简称）→ 取最上面有名字的项（聊天结果排最前）
+            for item in result_list.GetChildren():
+                if item.ControlType == 50007 and item.Name:
+                    target = item
+                    break
+    except (LookupError, COMError, TypeError) as e:
+        raise ToolError(f"定位搜索结果 [{user_name}] 失败: {e}") from e
+    if target is None:
+        raise ToolError(f"搜索结果里找不到会话 [{user_name}]")
+
+    # 把双击拆成两次单击：第一次点搜索结果目标，隔半秒后在主窗口"会话"列表里找同名项再点一次
+    try:
+        target.Click(simulateMove=False)  # 第一次单击：搜索结果里的目标
     except (LookupError, COMError, TypeError):
-        # 第一次双击失败，兜底：搜索框中心下方 10px 再双击一次（x/y 是相对左上角的偏移）
-        try:
-            r = win_search.BoundingRectangle
-            win_search.DoubleClick(r.width() // 2, r.height() // 2 + 100,
-                                   )
-        except (LookupError, COMError, TypeError) as e:
-            raise ToolError(f"双击打开会话 [{user_name}] 失败：搜索框下方兜底双击也未成功") from e
-        return _find_chat_window(user_name)
+        pass
+    time.sleep(0.5)
+    # 第二次：主窗口"会话"列表里同名项 双击（双击才打开 ChatWnd 窗口）
+    target2 = None
+    try:
+        chat_list = win_weChat.ListControl(Name="会话")
+        for item in chat_list.GetChildren():
+            nm = (item.Name or '')
+            if nm == user_name or nm == target.Name or user_name in nm:
+                target2 = item
+                break
+        if target2 is not None:
+            target2.DoubleClick(simulateMove=False)
+    except (LookupError, COMError, TypeError):
+        pass
+
+    # ① 等窗口出现（给两次单击 3 秒生效时间）
+    win_chat_user = auto.WindowControl(RegexName=f".*{clean_conv_name(user_name)}.*", ClassName="ChatWnd")
+    if win_chat_user.Exists(3):
+        return win_chat_user
+
+    # ② 没出现 → 对最近点过的目标真实鼠标双击（simulateMove=True 会移动真实鼠标）
+    try:
+        (target2 or target).DoubleClick(simulateMove=True)
+    except (LookupError, COMError, TypeError) as e:
+        raise ToolError(f"双击打开会话 [{user_name}] 失败: {e}") from e
+    return _find_chat_window(user_name)  # 再等 5 秒，仍无 → 抛"搜索后未找到会话"
 
 
 def search_wechat(keyword: str) -> list[str]:
@@ -410,16 +491,13 @@ def _click_load_more(user_control) -> bool:
 
 
 def _load_more_history(user_control:WindowControl) -> bool:
-    """把"查看更多消息"按钮点到底，加载全部历史。返回是否确实加载过更多。"""
+    """点一次"查看更多消息"加载更多（不循环点到底）。返回是否确实加载了。"""
     try:
         activate_window(user_control, "ChatWnd", maximize=False)
-        loaded_any = False
-        for _ in range(20):  # 最多 20 轮，防止死循环
-            if not _click_load_more(user_control):
-                break  # 找不到/点不到按钮 = 加载完了
-            loaded_any = True
+        if _click_load_more(user_control):
             time.sleep(1.5)  # 等微信加载
-        return loaded_any
+            return True
+        return False
     except (LookupError, COMError, TypeError):
         return False
 
@@ -427,7 +505,7 @@ def _load_more_history(user_control:WindowControl) -> bool:
 def get_msg_list(user_control:WindowControl, load_more:bool=False):
     loaded_any = False
     if load_more:
-        loaded_any = _load_more_history(user_control)  # 尝试把历史拉满
+        loaded_any = _load_more_history(user_control)  # 点一次加载更多
     msg_list=[]
     try:
         activate_window(user_control, "ChatWnd", maximize=False)
@@ -454,4 +532,99 @@ def get_msg_list(user_control:WindowControl, load_more:bool=False):
     if load_more and not loaded_any:
         return {"提示": "没有更多消息了", "全部消息": msg_list}
     return msg_list
+
+
+# ============ 主页消息监听（monitorHomeChats 用的轻量读取）============
+
+# 主页会话行右上角的时间/日期标签，判断"最后一条消息"时要排除，避免"10:30→昨天"这类误报
+_TIME_LABEL_RE = re.compile(
+    r"^(刚刚|昨天|前天|星期[一二三四五六日]|"
+    r"\d{1,2}:\d{2}|"
+    r"\d+分钟前|\d+小时前|\d+天前|\d+月前|\d+年前|"
+    r"\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日)$")
+
+_monitor_saved_rect = None  # 监听前微信窗口原始矩形，监听结束后还原
+
+
+def _monitor_item_preview(item) -> str:
+    """从主页会话项里取"最后一条消息"预览（排除未读徽标和时间标签，取最底部文本）。"""
+    item_r = item.BoundingRectangle
+    top_limit = item_r.top + item_r.height() * 0.6  # 徽标/时间在项的上半部
+    texts = []
+    for c, depth in auto.WalkControl(item, maxDepth=4):
+        if c.ControlTypeName != 'TextControl' or not c.Name:
+            continue
+        nm = c.Name.strip()
+        if not nm:
+            continue
+        r = c.BoundingRectangle
+        if nm.isdigit() and r.top < top_limit:
+            continue  # 未读徽标（右上角小数字）
+        if _TIME_LABEL_RE.match(nm):
+            continue  # 时间标签
+        texts.append(nm)
+    return texts[-1] if texts else ""
+
+
+def monitor_setup():
+    """监听开始：确保窗口可见，摆到"当前宽度 + 满高 + 靠右"（微信当前所在显示器）。记住原矩形。"""
+    global _monitor_saved_rect
+    hwnd = win32gui.FindWindow(CLASS_NAME, None)
+    if not hwnd:
+        raise ToolError("找不到微信主窗口，请确认微信已登录")
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    _monitor_saved_rect = win32gui.GetWindowRect(hwnd)
+    monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    work = win32api.GetMonitorInfo(monitor)['Work']  # pywin32 键名是 'Work'，不是 API 结构体的 'rcWork'
+    w = _monitor_saved_rect[2] - _monitor_saved_rect[0]  # 保持当前宽度
+    x = work[2] - w  # 靠右
+    win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, work[1], w,
+                          work[3] - work[1], win32con.SWP_SHOWWINDOW)
+
+
+def monitor_restore():
+    """监听结束：把微信窗口还原到监听前的位置/大小。"""
+    global _monitor_saved_rect
+    if not _monitor_saved_rect:
+        return
+    hwnd = win32gui.FindWindow(CLASS_NAME, None)
+    if hwnd:
+        r = _monitor_saved_rect
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, r[0], r[1],
+                              r[2] - r[0], r[3] - r[1], win32con.SWP_SHOWWINDOW)
+    _monitor_saved_rect = None
+
+
+def monitor_scan_once(after: str = "keep") -> dict:
+    """扫描一次主页：滚到顶 + 读可见会话。
+
+    after: 扫描后窗口处置 —— "keep"保持不动 / "minimize"最小化 / "hide"托盘隐藏(有风险)。
+    返回 {会话名: {"最新消息": 预览, "未读数": n}}。
+    """
+    hwnd = win32gui.FindWindow(CLASS_NAME, None)
+    if not hwnd:
+        raise ToolError("微信主窗口不存在")
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    # 必须在当前线程新建 WindowControl：uiautomation 的 COM 不能跨线程用别的线程创建的控件
+    win = auto.WindowControl(Name=WINDOW_NAME, ClassName=CLASS_NAME)
+    win.SetActive()  # 滚轮滚动需要窗口在最前
+    lst = win.ListControl(Name="会话")
+    _scroll_to_top(lst)  # 滚动条滚到最上面（新消息会话会跳到顶部，保证可见）
+    result = {}
+    for item in lst.GetChildren():
+        nm = item.Name
+        if not nm:
+            continue
+        m = re.search(r"(\d+)条新消息$", nm)
+        result[re.sub(r"\s*\d+条新消息$", "", nm)] = {
+            "最新消息": _monitor_item_preview(item),
+            "未读数": int(m.group(1)) if m else 0,
+        }
+    if after == "minimize":
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+    elif after == "hide":
+        win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+    return result
 
