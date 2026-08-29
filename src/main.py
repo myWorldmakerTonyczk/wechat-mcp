@@ -26,32 +26,30 @@ mcp = FastMCP("use_weChat",instructions=
                                           (iii) changeEnv 改配置（重要！非必要别自己动，让用户改）
                                           (iv) 重新 openWeChat
 
-                                        【拿会话列表】三者选一，别搞混：
-                                          listHomeChats      → 只要主页当前可见的（快，不滚动）
-                                          listWeChatPartners → 要全部会话（慢，全量滚动扫描）
-                                          getCachedList      → 要上次扫描的缓存（秒回，可能过期；kind="partners"）
+                                        【拿会话列表】：
+                                          listHomeChats(full_scan=False) → 主页当前可见会话（快，含 名称/未读数/最后一条消息）
+                                          listHomeChats(full_scan=True)  → 全部会话（慢，滚动全扫，同样带信息）
+                                          getCachedList("partners")      → 上次全量扫描的缓存会话名（秒回，可能过期）
 
                                         【拿联系人】：
                                           listWeChatContacts → 全量联系人（慢）
-                                          getCachedList      → 缓存（秒回；kind="contacts"）
-                                          searchWeChat      → 用微信自带搜索框搜关键字（联系人/群聊/公众号，支持拼音，快）
+                                          getCachedList("contacts") → 缓存（秒回）
+                                          searchWeChat      → 用搜索框搜关键字（联系人/群聊/公众号，支持拼音，快）
 
-                                        【操作某个会话】必须先拿到会话名：
-                                          1. listWeChatPartners 或 getCachedList 拿会话名
-                                          2. openPartnerWindow 打开该会话窗口
-                                          3. 之后才能 sendMsg / get_msg_list / get_recent_messages
-                                        sendMsg：call=None 发文本 msg；call="voice"/"video" 发起语音/视频通话；call="hangup" 挂断当前通话
+                                        【读/发消息】先拿到会话名（listHomeChats/getCachedList）：
+                                          get_msg_list(userName, load_more, recent) → 读会话消息，窗口没开会自动打开
+                                            recent=N 只要最近 N 条纯文本（去时间标签）；0=全量（含"[时间]："标签）
+                                            load_more=True 每次点一次"查看更多消息"加载更早的一批
+                                          sendMsg(userName, msg, call) → 发文本/语音视频通话/挂断；需要窗口已开（先 get_msg_list 或 openPartnerWindow）
+                                          openPartnerWindow(userName) → 显式打开会话窗口（get_msg_list 已自动开，一般不必手动调）
 
-                                        【读消息】：
-                                          get_msg_list(userName, load_more, recent) → 消息列表（带发送者前缀+时间标签）；
-                                            load_more=True 点一次"查看更多消息"加载更多；recent=N 只要最近 N 条纯文本（去掉时间标签）
-
-                                        【监听主页消息】：
-                                          monitorStart(duration, interval, after) → 启动后台监听（秒回，不阻塞），
-                                            后台线程轮询主页会话，最新消息变化（预览变/未读增/新会话出现）累计记录。
-                                          monitorPoll(stop=False) → 查询状态 + 累计变化（秒回）；
-                                            有变化时自动停止监听并清空；stop=True 强制立刻停。
-                                          注意：MCP 单次调用有 60s 超时，别用长阻塞调用，用 start+poll 组合。
+                                        【监听主页新消息】：
+                                          monitorStart(duration, interval, after) → 启动后台监听（秒回）；返回"初始未读"（当前有未读的会话）
+                                            duration 监听秒数；interval 刷新间隔(建议≥3)；after 窗口处置 keep/minimize/hide
+                                          monitorPoll(stop=False) → 查状态+累计变化（秒回）
+                                            有变化会自动停止监听并清空本次变化（agent 要操作窗口，避免打架）；stop=True 强制立刻停
+                                          monitorHomeChats 是 monitorStart 的兼容别名
+                                          注意：MCP 单次调用有 60s 超时，别用长阻塞；监听用 start+poll 组合。
 
                                         【找其他软件】list_desktop_apps 列出全部；get_app_path 按名字查。
                                         """
